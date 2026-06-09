@@ -219,6 +219,9 @@ export async function runAgent(
   // recommends. Fallback: match candidates against the final answer text.
   const candidateCards: any[] = [];
   let chosenProductIds: string[] = [];
+  // Article cards collected during the turn; emitted at the end for the ones the
+  // answer actually links to (so we show a thumbnail next to each cited guide).
+  const candidateArticles: any[] = [];
 
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -250,6 +253,8 @@ export async function runAgent(
           const outcome = await executeTool(tc.name, tc.input, { customerToken, isReturningCustomer });
           if (outcome.uiPayload?.type === "product_list") {
             candidateCards.push(...((outcome.uiPayload as any).rawProducts ?? []));
+          } else if (outcome.uiPayload?.type === "article_list") {
+            candidateArticles.push(...((outcome.uiPayload as any).articles ?? []));
           } else if (outcome.uiPayload) {
             events.onToolResponse(outcome.uiPayload);
           }
@@ -307,6 +312,24 @@ export async function runAgent(
         }),
       );
       events.onToolResponse({ type: "product_list", rawProducts: referenced });
+    }
+
+    // Article cards: emit the ones the answer actually links to (so the thumbnail
+    // sits next to the guide the model cited). Match by URL or article handle.
+    const lowerAnswer = fullAnswer.toLowerCase();
+    const articleSeen = new Set<string>();
+    const referencedArticles = candidateArticles.filter((a) => {
+      if (!a.url || articleSeen.has(a.url)) return false;
+      const handle = String(a.url).split("?")[0].replace(/\/+$/, "").split("/").pop()?.toLowerCase() || "";
+      const cited = lowerAnswer.includes(String(a.url).toLowerCase()) || (handle.length > 3 && lowerAnswer.includes(handle));
+      if (!cited) return false;
+      articleSeen.add(a.url);
+      return true;
+    }).slice(0, 4);
+    if (referencedArticles.length) {
+      const { hydrateArticleImages } = await import("./tools/blog.js");
+      await hydrateArticleImages(referencedArticles); // fill thumbnails for embedded guides
+      events.onToolResponse({ type: "article_list", articles: referencedArticles });
     }
 
     // Persist the raw turn (without the injected context block)

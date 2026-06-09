@@ -19,11 +19,16 @@ export const TOOLS: Anthropic.Tool[] = [
   {
     name: "search_articles",
     description:
-      "Search Organic's Best editorial articles (baby formula guides, nutrition advice, parenting tips). Call this BEFORE answering any advice, nutrition, ingredient, or how-to question so your answer is grounded in the store's own content. Returns article excerpts with titles and URLs to cite.",
+      "Search Organic's Best editorial articles (baby formula guides, nutrition advice, parenting tips). Call this BEFORE answering any advice, nutrition, ingredient, or how-to question so your answer is grounded in the store's own content. Returns article excerpts with titles and URLs to cite. For requests about the NEWEST/LATEST/RECENT articles or 'what's new', set sort='recent' (returns articles newest-first by publish date).",
     input_schema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "Natural-language search query, e.g. 'when to switch from stage 1 to stage 2'" },
+        query: { type: "string", description: "Natural-language search query, e.g. 'when to switch from stage 1 to stage 2'. For sort='recent' you may pass a topic or a generic phrase like 'latest articles'." },
+        sort: {
+          type: "string",
+          enum: ["relevance", "recent"],
+          description: "'relevance' (default) ranks by topical match. 'recent' returns the newest articles by publish date — use for 'latest/newest/recent articles' requests.",
+        },
       },
       required: ["query"],
     },
@@ -184,8 +189,27 @@ export interface ToolContext {
 export async function executeTool(name: string, input: any, ctx: ToolContext = {}): Promise<ToolOutcome> {
   switch (name) {
     case "search_articles": {
-      const res = await searchArticles(input.query);
-      return { resultForModel: JSON.stringify(res) };
+      const res = await searchArticles(input.query, 4, input.sort === "recent");
+      // Build de-duped article cards (image + title) for the app to render.
+      const cards: any[] = [];
+      if (Array.isArray(res)) {
+        const seen = new Set<string>();
+        for (const a of res) {
+          if (!a.url || seen.has(a.url)) continue;
+          seen.add(a.url);
+          cards.push({
+            title: a.title,
+            url: a.url,
+            image: a.imageUrl,
+            excerpt: (a.text || "").replace(/\s+/g, " ").trim().slice(0, 160),
+            date: a.date,
+          });
+        }
+      }
+      return {
+        resultForModel: JSON.stringify(res),
+        uiPayload: cards.length ? { type: "article_list", articles: cards } : undefined,
+      };
     }
     case "search_catalog": {
       const args: any = { catalog: { query: input.query } };
