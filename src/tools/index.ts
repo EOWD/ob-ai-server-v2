@@ -12,6 +12,7 @@ import {
   fetchSubscriptionOffers,
   formatMoney,
   filterOffersForCustomer,
+  cartAddLines,
 } from "./shopify.js";
 import { searchArticles } from "./blog.js";
 
@@ -80,6 +81,11 @@ export const TOOLS: Anthropic.Tool[] = [
             properties: {
               product_variant_id: { type: "string" },
               quantity: { type: "integer", minimum: 1 },
+              selling_plan_id: {
+                type: "string",
+                description:
+                  "Optional. To add this line as a SUBSCRIPTION, pass the offer's sellingPlanId (and use its variantId as product_variant_id), both from get_product_details → subscription_offers. Omit for a one-time purchase.",
+              },
             },
             required: ["product_variant_id", "quantity"],
           },
@@ -282,12 +288,44 @@ export async function executeTool(name: string, input: any, ctx: ToolContext = {
           : undefined,
       };
     }
-    case "update_cart":
+    case "update_cart": {
+      // Adds go through the Storefront Cart API directly: it's the only path that
+      // supports selling plans (subscriptions) AND line attributes — so every AI
+      // add is tagged `_source: ai_assistant` for attribution. Quantity changes /
+      // removes (update_items) still use the MCP, unchanged.
+      const adds: any[] = Array.isArray(input.add_items) ? input.add_items : [];
+      const updates: any[] = Array.isArray(input.update_items) ? input.update_items : [];
+      if (adds.length) {
+        const lines = adds.map((i) => ({
+          merchandiseId: i.product_variant_id,
+          quantity: i.quantity ?? 1,
+          attributes: [{ key: "_source", value: "ai_assistant" }],
+          ...(i.selling_plan_id ? { sellingPlanId: i.selling_plan_id } : {}),
+        }));
+        let cart = await cartAddLines(input.cart_id, lines);
+        // If the same call also changed quantities/removed lines, apply those on
+        // the resulting cart via the MCP (rare to combine, but don't drop them).
+        if (updates.length) {
+          const res = await callStoreMcp("update_cart", { cart_id: cart.id, update_items: updates });
+          cart = res?.cart ?? cart;
+        }
+        return {
+          resultForModel: JSON.stringify({ cart }),
+          stateUpdates: typeof cart?.id === "string" && cart.id.includes("shopify/Cart") ? { cartId: cart.id } : undefined,
+        };
+      }
+      const res = await callStoreMcp(name, input);
+      const serialized = JSON.stringify(res);
+      const cartId =
+        res?.cart?.id ?? res?.id ?? serialized.match(/gid:\\?\/\\?\/shopify\\?\/Cart\\?\/[^"\s]+/)?.[0];
+      return {
+        resultForModel: serialized,
+        stateUpdates: typeof cartId === "string" && cartId.includes("shopify/Cart") ? { cartId } : undefined,
+      };
+    }
     case "get_cart": {
       const res = await callStoreMcp(name, input);
       const serialized = JSON.stringify(res);
-      // Persist the active cart id so follow-up turns ("add one more") reuse
-      // the same cart instead of creating a new one.
       const cartId =
         res?.cart?.id ?? res?.id ?? serialized.match(/gid:\\?\/\\?\/shopify\\?\/Cart\\?\/[^"\s]+/)?.[0];
       return {

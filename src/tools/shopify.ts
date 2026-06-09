@@ -174,6 +174,10 @@ export interface SubscriptionOffer {
   compareAtPrice?: string;
   /** Product page URL with variant + plan preselected */
   url: string;
+  /** Full variant gid — pass to update_cart as product_variant_id to add this offer. */
+  variantId: string;
+  /** Full selling-plan gid — pass to update_cart as selling_plan_id to add as a subscription. */
+  sellingPlanId: string;
 }
 
 export async function fetchSubscriptionOffers(productId: string, productUrl: string): Promise<SubscriptionOffer[]> {
@@ -224,11 +228,60 @@ export async function fetchSubscriptionOffers(productId: string, productUrl: str
           ? `${compareAt.toFixed(2)} ${adj.price.currencyCode}`
           : undefined,
       url: `${productUrl}?variant=${String(v.id).split("/").pop()}&selling_plan=${planId}`,
+      variantId: String(v.id),
+      sellingPlanId: String(best.node.sellingPlan?.id || ""),
     });
   }
   // Real discounts first (starter bundles, free-can deals), then by price
   offers.sort((a, b) => Number(!!b.compareAtPrice) - Number(!!a.compareAtPrice) || parseFloat(a.price) - parseFloat(b.price));
   return offers;
+}
+
+// --- Cart with selling plans (Storefront Cart API) --------------------------
+// The Storefront MCP cart tool can't add a sellingPlanId, so subscription lines
+// go through the Storefront Cart API directly. Same Storefront cart id the MCP
+// uses, so it stays the one shared cart.
+
+export interface CartLineInput {
+  merchandiseId: string; // variant gid
+  quantity: number;
+  sellingPlanId?: string; // omit for a one-time line
+  attributes?: { key: string; value: string }[]; // e.g. _source for attribution
+}
+
+const CART_RETURN_FIELDS = `id checkoutUrl totalQuantity cost { totalAmount { amount currencyCode } } lines(first: 50) { edges { node { id quantity attributes { key value } sellingPlanAllocation { sellingPlan { id name } } merchandise { ... on ProductVariant { id title product { title } } } } } }`;
+
+async function storefront(query: string, variables: Record<string, unknown>): Promise<any> {
+  const res = await fetch(`https://${config.shopifyDomain}/api/2024-04/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Storefront-Access-Token": process.env.SHOPIFY_STOREFRONT_TOKEN || "",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  return res.json();
+}
+
+/** Add lines (one-time and/or subscription) to a cart, creating one if needed.
+ *  Returns the cart { id, checkoutUrl, ... } or throws the userError. */
+export async function cartAddLines(cartId: string | undefined, lines: CartLineInput[]): Promise<any> {
+  if (!cartId) {
+    const j = await storefront(
+      `mutation($lines:[CartLineInput!]!){ cartCreate(input:{lines:$lines}){ cart { ${CART_RETURN_FIELDS} } userErrors { message } } }`,
+      { lines },
+    );
+    const p = j?.data?.cartCreate;
+    if (!p?.cart) throw new Error(p?.userErrors?.[0]?.message || j?.errors?.[0]?.message || "cartCreate failed");
+    return p.cart;
+  }
+  const j = await storefront(
+    `mutation($cartId:ID!,$lines:[CartLineInput!]!){ cartLinesAdd(cartId:$cartId, lines:$lines){ cart { ${CART_RETURN_FIELDS} } userErrors { message } } }`,
+    { cartId, lines },
+  );
+  const p = j?.data?.cartLinesAdd;
+  if (!p?.cart) throw new Error(p?.userErrors?.[0]?.message || j?.errors?.[0]?.message || "cartLinesAdd failed");
+  return p.cart;
 }
 
 /**
